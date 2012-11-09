@@ -1,64 +1,145 @@
 #!/bin/sh
 
 # GITLAB
-# Maintainer: @randx
-# App Version: 3.0
+# Maintainer: @dosire
+# App Version: 2.9
 
 # ABOUT
-# This script performs only PARTIAL installation of Gitlab:
-# * packages update
-# * redis, git, postfix etc
-# * ruby setup
-# * git, gitlab users
-# * gitolite fork
-# Is should be run as root or sudo user. 
+# This script performs a complete installation of Gitlab (master branch).
+# Is can be run with one command without needing _any_ user input after that.
+# This script only works on Amazon Web Services (AWS).
+# The operating system used is Ubuntu 12.04 64bit.
+
+# HOWTO
+# Signup for AWS, a free usage tier is available at http://aws.amazon.com/free/
+# Go to EC2 tab in the AWS console EC2 https://console.aws.amazon.com/ec2/home
+# Click the 'Launch Instance' button
+# Select: 'Quick launch wizard' and continue
+# Under "Choose a key pair" select "Create New"
+# Write a name for the key in "Name" field and Download it. Place it in a known location since it will be used in one of the next steps.
+# Under "Choose a Launch Configuration", select 'More Amazon Machine Images'.
+# Press 'Continue'
+# Enter 'ubuntu/images/ubuntu-precise-12.04-amd64-server-20120424' in the search field and press 'Search'
+# Select the only result (ami-3c994355) and press 'Continue'
+# Press 'Edit details' if you want to modify something, for example make the type 'c1.medium' to make the install faster.
+# Press the 'Launch' button
+# Press 'Close'
+# Click 'Security Groups' under the left hand menu 'NETWORK & SECURITY' in aws console.
+# Select the newly create security group, probably named 'quicklaunch-1'
+# Click on the Inbound tab
+# In the 'Create a new rule' dropdown select 'HTTP', leave the default value in the "Source" field.
+# Press 'Add Rule'
+# In the 'Create a new rule' dropdown select 'HTTPS', leave the default value in the "Source" field.
+# Press 'Add Rule'
+# Press 'Apply Rule Changes'
+# In Navigation side panel, under Instances -> Instances you can see when the instance is ready.
+# Give the following command in your local terminal while substituting the UPPERCASE items( ommit the '')
+# 'ssh -i LOCATION_OF_AWS_KEY_PAIR_PRIVATE_KEY ubuntu@PUBLIC_DNS_OF_THE_NEW_SERVER'
+# where LOCATION_OF_AWS_KEY_PAIR_PRIVATE_KEY is the location of the key saved on your local machine. Permissions of the .pem file have to be at least 600 (chmod 600 NAME_OF_PRIVATE_KEY.pem).
+# PUBLIC_DNS_OF_THE_NEW_SERVER can be viewed by selecting the aws instance created in previous steps and selecting the 'Description' tab
+# Execute the curl command below and when its ready follow the printed 'Log in instuctions'
+# curl https://raw.github.com/gitlabhq/gitlab-recipes/master/install/debian_ubuntu_aws.sh | sh
+
+# Prevent fingerprint prompt for localhost in step 1 to 3.
+echo "Host localhost
+   StrictHostKeyChecking no
+   UserKnownHostsFile=/dev/null" | sudo tee -a /etc/ssh/ssh_config
+
+sudo DEBIAN_FRONTEND='noninteractive' apt-get install -y postfix-policyd-spf-python postfix # Install postfix without prompting.
+
+# Existing script for Step 1 to 3
+curl https://raw.github.com/gitlabhq/gitlab-recipes/master/install/debian_ubuntu.sh >> debian_ubuntu.sh
+sed -i 's/postfix//' debian_ubuntu.sh # This will prompt even when postfix is already installed.
+sed -i '/sudo\ apt-get\ upgrade/d' debian_ubuntu.sh # Upgrade can cause prompting for various packages (grub, etc.).
+sh debian_ubuntu.sh
+
+# Install MySQL
+sudo apt-get install -y makepasswd # Needed to create a unique password non-interactively.
+userPassword=$(makepasswd --char=10) # Generate a random MySQL password
+# Note that the lines below creates a cleartext copy of the random password in /var/cache/debconf/passwords.dat
+# This file is normally only readable by root and the password will be deleted by the package management system after install.
+echo mysql-server mysql-server/root_password password $userPassword | sudo debconf-set-selections
+echo mysql-server mysql-server/root_password_again password $userPassword | sudo debconf-set-selections
+sudo apt-get install -y mysql-server
+
+# Gitlab install
+sudo gem install charlock_holmes --version '0.6.8'
+sudo pip install pygments
+sudo gem install bundler
+sudo su -l gitlab -c "git clone git://github.com/nickgal/gitlabhq.git gitlab" # Using master everywhere.
+sudo su -l gitlab -c "cd gitlab && mkdir tmp"
+sudo su -l gitlab -c "cd gitlab/config && cp gitlab.yml.example gitlab.yml"
+sudo su -l gitlab -c "cd gitlab/config && cp database.yml.example database.yml"
+sudo sed -i 's/"secure password"/"'$userPassword'"/' /home/gitlab/gitlab/config/database.yml # Insert the mysql root password.
+sudo su -l gitlab -c "cd gitlab && bundle install --without development test sqlite postgres --deployment"
+sudo su -l gitlab -c "cd gitlab && bundle exec rake gitlab:app:setup RAILS_ENV=production"
+
+# Setup gitlab hooks
+sudo cp /home/gitlab/gitlab/lib/hooks/post-receive /home/git/.gitolite/hooks/common/post-receive
+sudo chown git:git /home/git/.gitolite/hooks/common/post-receive
+sudo chmod g+rwx /home/git/.gitolite # sort out permissions https://github.com/gitlabhq/gitlabhq/issues/1543
+sudo usermod -g git gitlab
 
 
-sudo apt-get update
-sudo apt-get upgrade
+# Set the first occurrence of host in the Gitlab config to the publicly available domain name
+sudo sed -i '0,/host/s/localhost/'`wget -qO- http://instance-data/latest/meta-data/public-hostname`'/' /home/gitlab/gitlab/config/gitlab.yml
 
-sudo apt-get install -y git git-core wget curl gcc checkinstall libxml2-dev libxslt-dev sqlite3 libsqlite3-dev libcurl4-openssl-dev libreadline6-dev libc6-dev libssl-dev libmysql++-dev make build-essential zlib1g-dev libicu-dev redis-server openssh-server python-dev python-pip libyaml-dev postfix
+# Tighten security
+sudo -u git chmod 750 /home/git/gitolite
+sudo -u gitlab chmod 660 /home/gitlab/gitlab/config/*.yml
 
-wget http://ftp.ruby-lang.org/pub/ruby/1.9/ruby-1.9.3-p194.tar.gz
-tar xfvz ruby-1.9.3-p194.tar.gz
-cd ruby-1.9.3-p194
-./configure
-make
-sudo make install
+# Install and configure Nginx
+sudo apt-get install -y nginx
+sudo wget https://raw.github.com/gitlabhq/gitlab-recipes/master/nginx/gitlab -P /etc/nginx/sites-available/
+sudo ln -s /etc/nginx/sites-available/gitlab /etc/nginx/sites-enabled/gitlab
+sudo sed -i 's/YOUR_SERVER_IP/'`wget -qO- http://instance-data/latest/meta-data/local-ipv4`'/' /etc/nginx/sites-available/gitlab # Set private ip address (public won't work).
+sudo sed -i 's/YOUR_SERVER_FQDN/'`wget -qO- http://instance-data/latest/meta-data/public-hostname`'/' /etc/nginx/sites-available/gitlab # Set public dns domain name.
 
-sudo adduser \
-  --system \
-  --shell /bin/sh \
-  --gecos 'git version control' \
-  --group \
-  --disabled-password \
-  --home /home/git \
-  git
+# Configure Unicorn
+sudo -u gitlab cp /home/gitlab/gitlab/config/unicorn.rb.example /home/gitlab/gitlab/config/unicorn.rb
 
-sudo adduser --disabled-login --gecos 'gitlab system' gitlab
+# Create a Gitlab service
+sudo wget https://raw.github.com/gitlabhq/gitlab-recipes/master/init.d/gitlab -P /etc/init.d/
+sudo chmod +x /etc/init.d/gitlab && sudo update-rc.d gitlab defaults
 
-sudo usermod -a -G git gitlab
-sudo usermod -a -G gitlab git
+## Gitlab service commands (unicorn and resque)
+## restart doesn't restart resque, only start/stop effect it.
+sudo -u gitlab service gitlab start
 
-sudo -H -u gitlab ssh-keygen -q -N '' -t rsa -f /home/gitlab/.ssh/id_rsa
+# nginx Service commands
+sudo service nginx restart
 
-cd /home/git
-sudo -u git -H mkdir bin
-sudo -H -u git git clone -b gl-v304 https://github.com/gitlabhq/gitolite.git /home/git/gitolite
-sudo -u git sh -c 'echo -e "PATH=\$PATH:/home/git/bin\nexport PATH" >> /home/git/.profile'
-sudo -u git sh -c 'gitolite/install -ln /home/git/bin'
+# Go to gitlab directory by default on next login.
+echo 'cd /home/gitlab/gitlab' >> /home/ubuntu/.bashrc
 
-sudo cp /home/gitlab/.ssh/id_rsa.pub /home/git/gitlab.pub
-sudo chmod 0444 /home/git/gitlab.pub
+echo ''
+echo '###########################################'
+echo '#          Log in instuctions             #'
+echo '###########################################'
+echo ''
+echo "Surf to this Gitlab installation in your browser:"
+echo "http://`wget -qO- http://instance-data/latest/meta-data/public-hostname`/"
+echo ''
+echo 'and login with the following Email and Password:'
+echo 'admin@local.host'
+echo '5iveL!fe'
 
-sudo -u git -H sh -c "PATH=/home/git/bin:$PATH; gitolite setup -pk /home/git/gitlab.pub"
+# If you need it the database password can be found in '/home/gitlab/gitlab/config/database.yml'.
 
+# Gitlab installation test:
+# sudo -u gitlab bundle exec rake gitlab:app:status RAILS_ENV=production
 
+# Stating and stopping services:
+# To stop gitlab use: 'sudo -u gitlab service gitlab stop'
+# To stop nginx server use: 'sudo service nginx stop'
+# Replace stop with start to start those services.
 
+# Manual startup commands for troubleshooting when the service commands do not work:
+# sudo -u gitlab bundle exec unicorn_rails -c config/unicorn.rb -E production -D
+# sudo su -l gitlab -c "cd gitlab && ./resque.sh"
+# sudo -u gitlab bundle exec rails s -e production
+# sudo -u gitlab bundle exec rake environment resque:work QUEUE=* RAILS_ENV=production BACKGROUND=no
 
-
-sudo chmod -R g+rwX /home/git/repositories/
-sudo chown -R git:git /home/git/repositories/
-
-sudo -u gitlab -H git clone git@localhost:gitolite-admin.git /tmp/gitolite-admin
-sudo rm -rf /tmp/gitolite-admin
+# Monitoring commands for the web server:
+# sudo tail -f /var/log/nginx/access.log
+# sudo tail -f /var/log/nginx/error.log
